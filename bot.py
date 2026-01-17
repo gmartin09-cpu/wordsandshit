@@ -11,7 +11,7 @@ import discord
 from discord.ext import commands
 
 # =========================
-# Environment / Config
+# Env / Config
 # =========================
 
 def require_env(name: str) -> str:
@@ -26,9 +26,9 @@ def require_env(name: str) -> str:
 
 DISCORD_TOKEN = require_env("DISCORD_TOKEN")
 WORDS_FILE = require_env("WORDS_FILE")
-WORDS_URL = os.getenv("WORDS_URL")  # optional (needed if WORDS_FILE isn't in the container)
+WORDS_URL = os.getenv("WORDS_URL")  # optional (needed if WORDS_FILE isn't baked into container)
 
-# Download the big dataset if it doesn't exist in the container
+# Download dataset if missing
 if not os.path.exists(WORDS_FILE):
     if not WORDS_URL:
         raise RuntimeError("WORDS_FILE not found and WORDS_URL not set. Provide WORDS_URL in Railway Variables.")
@@ -37,33 +37,50 @@ if not os.path.exists(WORDS_FILE):
     print("Download complete.", flush=True)
 
 # =========================
-# Streaming Parser (your JS-ish dump)
+# Normalization helpers
 # =========================
 
-CAT_RE = re.compile(r"""\br0\s*=\s*\{(?P<body>.*?)\}\s*;""", re.VERBOSE)
+def norm_hint(s: str) -> str:
+    return s.strip().lower()
+
+def norm_cat(s: str) -> str:
+    """
+    Category normalization that makes:
+      "Foods & Drinks" == "Foods and Drinks" == "foods/drinks"
+    """
+    s = s.strip().lower()
+    s = s.replace("&", " and ")
+    # remove punctuation to spaces
+    s = re.sub(r"[^a-z0-9]+", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+# =========================
+# Streaming Parser (JS-ish dump)
+# =========================
+
+CAT_LINE_RE = re.compile(r"""\br0\s*=\s*\{(?P<body>.*?)\}\s*;""")
 CAT_ID_RE = re.compile(r"'category_id'\s*:\s*'([^']*)'")
 CAT_NAME_RE = re.compile(r"'name'\s*:\s*'([^']*)'")
 
 WORD_HINT_RE = re.compile(
-    r"""\{\s*'word'\s*:\s*'(?P<word>[^']*)'\s*,\s*'hint'\s*:\s*'(?P<hint>[^']*)'\s*\}\s*;""",
-    re.VERBOSE,
+    r"""\{\s*'word'\s*:\s*'(?P<word>[^']*)'\s*,\s*'hint'\s*:\s*'(?P<hint>[^']*)'\s*\}\s*;"""
 )
 
 Record = Tuple[str, str, str, str]  # (category_id, category_name, word, hint)
 
-def _norm(s: str) -> str:
-    return s.strip().lower()
-
 def iter_jsdump_records(path: str):
-    """Yield (cat_id, cat_name, word, hint) in a single streaming pass."""
+    """
+    Yields (category_id, category_name, word, hint) in one streaming pass.
+    Assumes format like your example.
+    """
     current_cat_id = "unknown"
     current_cat_name = "Unknown"
 
     with open(path, "r", encoding="utf-8", errors="replace") as f:
         for line in f:
-            # category line
             if "r0" in line and "category_id" in line:
-                m = CAT_RE.search(line)
+                m = CAT_LINE_RE.search(line)
                 if m:
                     body = m.group("body")
                     mid = CAT_ID_RE.search(body)
@@ -73,23 +90,71 @@ def iter_jsdump_records(path: str):
                     if mname:
                         current_cat_name = mname.group(1)
 
-            # word/hint line
             if "'word'" in line and "'hint'" in line:
                 wm = WORD_HINT_RE.search(line)
                 if wm:
                     yield (current_cat_id, current_cat_name, wm.group("word"), wm.group("hint"))
 
+def iter_categories_only(path: str):
+    """Yields (category_id, category_name) by scanning only category definition lines."""
+    current_cat_id = None
+    current_cat_name = None
+
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            if "r0" in line and "category_id" in line:
+                m = CAT_LINE_RE.search(line)
+                if not m:
+                    continue
+                body = m.group("body")
+                mid = CAT_ID_RE.search(body)
+                mname = CAT_NAME_RE.search(body)
+                if mid and mname:
+                    cid = mid.group(1)
+                    cname = mname.group(1)
+                    yield cid, cname
+
+# =========================
+# Category alias map (startup)
+# =========================
+
+# alias -> (category_id, category_name)
+CAT_ALIASES: Dict[str, Tuple[str, str]] = {}
+
+def build_category_aliases(path: str) -> Dict[str, Tuple[str, str]]:
+    aliases: Dict[str, Tuple[str, str]] = {}
+    for cid, cname in iter_categories_only(path):
+        # primary aliases
+        a1 = norm_cat(cname)
+        a2 = norm_cat(cid)
+        # store both; last write wins (normally unique)
+        aliases[a1] = (cid, cname)
+        aliases[a2] = (cid, cname)
+
+        # extra alias: remove a leading "the " etc (optional)
+        if a1.startswith("the "):
+            aliases[a1[4:]] = (cid, cname)
+    return aliases
+
+print("Building category aliases...", flush=True)
+CAT_ALIASES = build_category_aliases(WORDS_FILE)
+print(f"Category aliases loaded: {len(CAT_ALIASES)}", flush=True)
+
+# =========================
+# Solver
+# =========================
+
 def solve_hint(
     path: str,
     query_hint: str,
-    allowed_categories: Optional[Set[str]] = None,  # normalized category names and/or IDs
+    allowed_cat_ids_norm: Optional[Set[str]] = None,  # normalized category_id strings
     mode: str = "exact",  # exact / contains / startswith / endswith
-    limit: int = 200,     # safety cap
+    limit: int = 200,
 ) -> Dict[str, List[str]]:
-    q = _norm(query_hint)
+    q = norm_hint(query_hint)
 
     def hint_ok(h: str) -> bool:
-        rh = _norm(h)
+        rh = norm_hint(h)
         if mode == "exact":
             return rh == q
         if mode == "contains":
@@ -104,8 +169,8 @@ def solve_hint(
     total = 0
 
     for cat_id, cat_name, word, hint in iter_jsdump_records(path):
-        if allowed_categories is not None:
-            if _norm(cat_id) not in allowed_categories and _norm(cat_name) not in allowed_categories:
+        if allowed_cat_ids_norm is not None:
+            if norm_cat(cat_id) not in allowed_cat_ids_norm:
                 continue
 
         if hint_ok(hint):
@@ -117,35 +182,12 @@ def solve_hint(
 
     return grouped
 
-# =========================
-# Discord Bot
-# =========================
-
-intents = discord.Intents.default()
-intents.message_content = True  # must also be enabled in Discord Developer Portal
-
-bot = commands.Bot(command_prefix=".", intents=intents)
-
-# Per-user category filters in memory (Railway restarts reset this; add DB later if desired)
-USER_CATS: Dict[int, Set[str]] = {}
-
-def parse_quoted_args(s: str) -> List[str]:
-    """
-    Parses:  .categories "Everyday Objects" "Foods & Drinks"
-    Returns: ["Everyday Objects", "Foods & Drinks"]
-    Also allows unquoted tokens: .categories everyday_objects food_drinks
-    """
-    return [
-        m.group(1) if m.group(1) is not None else m.group(2)
-        for m in re.finditer(r'"([^"]+)"|(\S+)', s)
-    ]
-
 def format_compact(grouped: Dict[str, List[str]]) -> str:
     total = sum(len(v) for v in grouped.values())
     if total == 0:
         return "No matches."
 
-    # Flatten unique words across categories (simple output like your example)
+    # unique words across categories (simple output)
     words: List[str] = []
     seen = set()
     for cat in sorted(grouped.keys(), key=lambda c: (-len(grouped[c]), c.lower())):
@@ -160,6 +202,25 @@ def format_compact(grouped: Dict[str, List[str]]) -> str:
         return f"1 Match:\n{words[0]}"
     return f"{len(words)} Matches:\n" + "\n".join(words)
 
+# =========================
+# Discord Bot
+# =========================
+
+intents = discord.Intents.default()
+intents.message_content = True  # must be enabled in Discord Dev Portal too
+
+bot = commands.Bot(command_prefix=".", intents=intents, help_command=None)
+
+# Per-user category filter: store normalized category IDs
+USER_ALLOWED_CAT_IDS: Dict[int, Set[str]] = {}
+
+def parse_quoted_args(s: str) -> List[str]:
+    # supports: "Foods & Drinks" or unquoted tokens
+    return [
+        m.group(1) if m.group(1) is not None else m.group(2)
+        for m in re.finditer(r'"([^"]+)"|(\S+)', s)
+    ]
+
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user} (id={bot.user.id})", flush=True)
@@ -168,14 +229,13 @@ async def on_ready():
 async def categories_cmd(ctx: commands.Context):
     """
     Usage:
-      .categories "Everyday Objects" "Foods & Drinks"
-      .categories everyday_objects food_drinks
+      .categories "Everyday Objects" "Foods and Drinks"
       .categories clear
       .categories show
     """
     raw = ctx.message.content[len(".categories"):].strip()
     if not raw:
-        await ctx.reply('Usage: .categories "Everyday Objects" "Foods & Drinks"  OR  .categories clear  OR  .categories show')
+        await ctx.reply('Usage: .categories "Everyday Objects" "Foods and Drinks"  OR  .categories clear  OR  .categories show')
         return
 
     tokens = parse_quoted_args(raw)
@@ -184,27 +244,42 @@ async def categories_cmd(ctx: commands.Context):
         return
 
     if len(tokens) == 1 and tokens[0].lower() == "clear":
-        USER_CATS.pop(ctx.author.id, None)
+        USER_ALLOWED_CAT_IDS.pop(ctx.author.id, None)
         await ctx.reply("Cleared category filter (all categories allowed).")
         return
 
     if len(tokens) == 1 and tokens[0].lower() == "show":
-        allowed = USER_CATS.get(ctx.author.id)
+        allowed = USER_ALLOWED_CAT_IDS.get(ctx.author.id)
         if not allowed:
             await ctx.reply("No category filter set (all categories allowed).")
         else:
-            # show original-ish strings (we only stored normalized; show normalized)
-            await ctx.reply("Current categories:\n" + "\n".join(sorted(allowed)))
+            await ctx.reply("Current allowed category IDs:\n" + "\n".join(sorted(allowed)))
         return
 
-    USER_CATS[ctx.author.id] = {_norm(t) for t in tokens}
-    await ctx.reply("Set!")
+    resolved_ids: Set[str] = set()
+    unresolved: List[str] = []
+
+    for t in tokens:
+        key = norm_cat(t)
+        hit = CAT_ALIASES.get(key)
+        if hit:
+            cid, _cname = hit
+            resolved_ids.add(norm_cat(cid))
+        else:
+            # If they typed an exact category_id, this still might work
+            # but if it's not in aliases, we store it and hope it matches raw data.
+            unresolved.append(t)
+            resolved_ids.add(norm_cat(t))
+
+    USER_ALLOWED_CAT_IDS[ctx.author.id] = resolved_ids
+
+    if unresolved:
+        await ctx.reply("Set! (Some categories didn't resolve exactly, but were stored anyway.)")
+    else:
+        await ctx.reply("Set!")
 
 @bot.event
 async def on_message(message: discord.Message):
-    # Let command handler run first
-    await bot.process_commands(message)
-
     if message.author.bot:
         return
 
@@ -212,25 +287,25 @@ async def on_message(message: discord.Message):
     if not content.startswith("."):
         return
 
-    # Don't treat commands as hints
+    # If it's the categories command, let discord.py handle it.
     if content.lower().startswith(".categories"):
+        await bot.process_commands(message)
         return
 
-    # Interpret ".yeast" as hint "yeast"
+    # Everything else like ".british" ".compass" ".flush" is a HINT QUERY (not a command).
     hint = content[1:].strip()
     if not hint:
         return
 
-    allowed = USER_CATS.get(message.author.id)
+    allowed_ids = USER_ALLOWED_CAT_IDS.get(message.author.id)
 
-    # Run the file scan off the event loop
     loop = asyncio.get_running_loop()
     grouped = await loop.run_in_executor(
         None,
         lambda: solve_hint(
             WORDS_FILE,
             hint,
-            allowed_categories=allowed,
+            allowed_cat_ids_norm=allowed_ids,
             mode="exact",
             limit=200,
         ),
@@ -242,5 +317,4 @@ async def on_message(message: discord.Message):
 
     await message.reply(reply)
 
-# Start the bot
 bot.run(DISCORD_TOKEN)
