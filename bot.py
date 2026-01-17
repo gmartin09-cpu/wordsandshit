@@ -272,11 +272,14 @@ async def categories_cmd(ctx: commands.Context):
             resolved_ids.add(norm_cat(t))
 
     USER_ALLOWED_CAT_IDS[ctx.author.id] = resolved_ids
-
-    if unresolved:
-        await ctx.reply("Set! (Some categories didn't resolve exactly, but were stored anyway.)")
+    
+        if unresolved and not resolved_ids:
+        await ctx.reply("No valid categories were recognized.")
+    elif unresolved:
+        await ctx.reply("Set! (Some category names were ignored.)")
     else:
         await ctx.reply("Set!")
+
 
 @bot.event
 async def on_message(message: discord.Message):
@@ -318,3 +321,4 @@ async def on_message(message: discord.Message):
     await message.reply(reply)
 
 bot.run(DISCORD_TOKEN)
+
