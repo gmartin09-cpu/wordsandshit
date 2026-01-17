@@ -7,12 +7,13 @@ Commands:
   .categories clear
   .categories show
   .findcat <search term>        (ex: .findcat food)
+  .listcats                     (prints a small sample + count)
 
 Hint query:
   .yeast
   .compass
   .british
-(Anything that starts with "." but is NOT ".categories" or ".findcat" is treated as a hint query.)
+(Anything starting with "." but NOT a bot command is treated as a hint query.)
 """
 
 import os
@@ -44,10 +45,9 @@ def require_env(name: str) -> str:
 
 DISCORD_TOKEN = require_env("DISCORD_TOKEN")
 WORDS_FILE = require_env("WORDS_FILE")
-WORDS_URL = os.getenv("WORDS_URL")  # optional (needed if WORDS_FILE is not in container)
+WORDS_URL = os.getenv("WORDS_URL")  # optional (needed if WORDS_FILE isn't in container)
 
 
-# Download dataset if missing (Railway container filesystem)
 if not os.path.exists(WORDS_FILE):
     if not WORDS_URL:
         raise RuntimeError("WORDS_FILE not found and WORDS_URL not set. Provide WORDS_URL in Railway Variables.")
@@ -76,92 +76,127 @@ def norm_cat(s: str) -> str:
 
 
 # =========================
-# Streaming Parser (JS-ish dump)
+# Statement-based streaming parser (robust)
 # =========================
+# We split the file into "statements" by ';' so category objects / word objects
+# can span multiple lines and still be parsed.
 
-CAT_LINE_RE = re.compile(r"""\br0\s*=\s*\{(?P<body>.*?)\}\s*;""")
-CAT_ID_RE   = re.compile(r"'category_id'\s*:\s*'([^']*)'")
-CAT_NAME_RE = re.compile(r"'name'\s*:\s*'([^']*)'")
+CAT_ID_RE   = re.compile(r"""['"]category_id['"]\s*:\s*['"]([^'"]+)['"]""")
+CAT_NAME_RE = re.compile(r"""['"]name['"]\s*:\s*['"]([^'"]+)['"]""")
 
 WORD_HINT_RE = re.compile(
-    r"""\{\s*'word'\s*:\s*'(?P<word>[^']*)'\s*,\s*'hint'\s*:\s*'(?P<hint>[^']*)'\s*\}\s*;"""
+    r"""\{\s*['"]word['"]\s*:\s*['"](?P<word>[^'"]+)['"]\s*,\s*['"]hint['"]\s*:\s*['"](?P<hint>[^'"]+)['"]\s*\}""",
+    re.VERBOSE,
 )
 
 Record = Tuple[str, str, str, str]  # (category_id, category_name, word, hint)
 
+def iter_statements(path: str, max_stmt_chars: int = 200_000):
+    """
+    Yield semicolon-terminated statements from a huge file.
+    Keeps memory bounded by trimming if a statement goes insane.
+    """
+    buf = []
+    buf_len = 0
 
-def iter_jsdump_records(path: str):
-    """Yield (category_id, category_name, word, hint) in a single streaming pass."""
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            buf.append(line)
+            buf_len += len(line)
+
+            # If buffer becomes huge without ';', yield it anyway to avoid memory blowups.
+            if buf_len > max_stmt_chars:
+                stmt = "".join(buf)
+                yield stmt
+                buf.clear()
+                buf_len = 0
+                continue
+
+            # Split on ';' but keep everything before each ';' as a statement.
+            joined = "".join(buf)
+            if ";" not in joined:
+                continue
+
+            parts = joined.split(";")
+            # everything except the last part is complete statements
+            for stmt in parts[:-1]:
+                if stmt.strip():
+                    yield stmt + ";"
+            # last part becomes the new buffer (incomplete statement)
+            tail = parts[-1]
+            buf = [tail]
+            buf_len = len(tail)
+
+    # leftover tail
+    tail = "".join(buf).strip()
+    if tail:
+        yield tail
+
+def iter_records_and_categories(path: str):
+    """
+    Single pass: yields word/hint records AND builds category mapping.
+    Returns (records_generator, category_map) pattern is awkward for Python generators,
+    so instead this yields records and updates a shared dict.
+    """
     current_cat_id = "unknown"
     current_cat_name = "Unknown"
 
-    with open(path, "r", encoding="utf-8", errors="replace") as f:
-        for line in f:
-            # Category definition line
-            if "r0" in line and "category_id" in line:
-                m = CAT_LINE_RE.search(line)
-                if m:
-                    body = m.group("body")
-                    mid = CAT_ID_RE.search(body)
-                    mname = CAT_NAME_RE.search(body)
-                    if mid:
-                        current_cat_id = mid.group(1)
-                    if mname:
-                        current_cat_name = mname.group(1)
+    categories: Dict[str, str] = {}  # id -> name
 
-            # Word/hint line
-            if "'word'" in line and "'hint'" in line:
-                wm = WORD_HINT_RE.search(line)
-                if wm:
-                    yield (current_cat_id, current_cat_name, wm.group("word"), wm.group("hint"))
+    for stmt in iter_statements(path):
+        # Category object detection (works even if not on one line, and with ' or ")
+        if "category_id" in stmt and "name" in stmt:
+            mid = CAT_ID_RE.search(stmt)
+            mname = CAT_NAME_RE.search(stmt)
+            if mid and mname:
+                current_cat_id = mid.group(1)
+                current_cat_name = mname.group(1)
+                categories[current_cat_id] = current_cat_name
+                continue
 
+        # Word/hint object detection
+        if "word" in stmt and "hint" in stmt:
+            m = WORD_HINT_RE.search(stmt)
+            if m:
+                yield (current_cat_id, current_cat_name, m.group("word"), m.group("hint")), categories
 
-def iter_categories_only(path: str):
-    """Yield (category_id, category_name) by scanning category definition lines."""
-    with open(path, "r", encoding="utf-8", errors="replace") as f:
-        for line in f:
-            if "r0" in line and "category_id" in line:
-                m = CAT_LINE_RE.search(line)
-                if not m:
-                    continue
-                body = m.group("body")
-                mid = CAT_ID_RE.search(body)
-                mname = CAT_NAME_RE.search(body)
-                if mid and mname:
-                    yield mid.group(1), mname.group(1)
+def build_category_maps(path: str):
+    """
+    Scan until end, building:
+      - cat_id -> name
+      - aliases: normalized name/id -> (id, name)
+    """
+    cat_by_id: Dict[str, str] = {}
+    # We don't actually need to store all records here, just walk statements once
+    for _rec, cats in iter_records_and_categories(path):
+        cat_by_id = cats  # same dict reference, updated over time
 
-
-# =========================
-# Category alias map (startup)
-# =========================
-
-# alias -> (category_id, category_name)
-CAT_ALIASES: Dict[str, Tuple[str, str]] = {}
-
-def build_category_aliases(path: str) -> Dict[str, Tuple[str, str]]:
     aliases: Dict[str, Tuple[str, str]] = {}
-    for cid, cname in iter_categories_only(path):
-        aliases[norm_cat(cname)] = (cid, cname)   # name alias
-        aliases[norm_cat(cid)] = (cid, cname)     # id alias
-        # tiny convenience alias (optional)
-        if cname.lower().startswith("the "):
-            aliases[norm_cat(cname[4:])] = (cid, cname)
-    return aliases
+    for cid, cname in cat_by_id.items():
+        aliases[norm_cat(cid)] = (cid, cname)
+        aliases[norm_cat(cname)] = (cid, cname)
 
-print("Building category aliases...", flush=True)
-CAT_ALIASES = build_category_aliases(WORDS_FILE)
-print(f"Category aliases loaded: {len(CAT_ALIASES)}", flush=True)
+    return cat_by_id, aliases
 
 
 # =========================
-# Solver
+# Build category maps at startup (one pass)
+# =========================
+
+print("Building category maps (one pass)...", flush=True)
+CAT_BY_ID, CAT_ALIASES = build_category_maps(WORDS_FILE)
+print(f"Categories discovered: {len(CAT_BY_ID)}", flush=True)
+
+
+# =========================
+# Solver (single streaming pass per query)
 # =========================
 
 def solve_hint(
     path: str,
     query_hint: str,
-    allowed_cat_ids_norm: Optional[Set[str]] = None,  # normalized category_id strings
-    mode: str = "exact",  # exact / contains / startswith / endswith
+    allowed_cat_ids_norm: Optional[Set[str]] = None,  # normalized cat_ids
+    mode: str = "exact",
     limit: int = 200,
 ) -> Dict[str, List[str]]:
     q = norm_hint(query_hint)
@@ -181,27 +216,45 @@ def solve_hint(
     grouped: DefaultDict[str, List[str]] = defaultdict(list)
     total = 0
 
-    for cat_id, cat_name, word, hint in iter_jsdump_records(path):
-        if allowed_cat_ids_norm is not None:
-            if norm_cat(cat_id) not in allowed_cat_ids_norm:
+    current_cat_id = "unknown"
+    current_cat_name = "Unknown"
+
+    for stmt in iter_statements(path):
+        # Track category as we stream
+        if "category_id" in stmt and "name" in stmt:
+            mid = CAT_ID_RE.search(stmt)
+            mname = CAT_NAME_RE.search(stmt)
+            if mid and mname:
+                current_cat_id = mid.group(1)
+                current_cat_name = mname.group(1)
                 continue
 
-        if hint_ok(hint):
-            header = f"{cat_name} ({cat_id})"
-            grouped[header].append(word)
-            total += 1
-            if total >= limit:
-                break
+        if "word" in stmt and "hint" in stmt:
+            m = WORD_HINT_RE.search(stmt)
+            if not m:
+                continue
+
+            if allowed_cat_ids_norm is not None:
+                if norm_cat(current_cat_id) not in allowed_cat_ids_norm:
+                    continue
+
+            hint = m.group("hint")
+            if hint_ok(hint):
+                word = m.group("word")
+                header = f"{current_cat_name} ({current_cat_id})"
+                grouped[header].append(word)
+                total += 1
+                if total >= limit:
+                    break
 
     return grouped
-
 
 def format_compact(grouped: Dict[str, List[str]]) -> str:
     total = sum(len(v) for v in grouped.values())
     if total == 0:
         return "No matches."
 
-    # Unique words across categories (compact output)
+    # Unique words across categories
     words: List[str] = []
     seen = set()
     for cat in sorted(grouped.keys(), key=lambda c: (-len(grouped[c]), c.lower())):
@@ -222,16 +275,14 @@ def format_compact(grouped: Dict[str, List[str]]) -> str:
 # =========================
 
 intents = discord.Intents.default()
-intents.message_content = True  # must also be enabled in Discord Developer Portal
+intents.message_content = True  # also enable in Discord Developer Portal
 
 bot = commands.Bot(command_prefix=".", intents=intents, help_command=None)
 
 # Per-user: store normalized category IDs
 USER_ALLOWED_CAT_IDS: Dict[int, Set[str]] = {}
 
-
 def parse_quoted_args(s: str) -> List[str]:
-    # supports: "Foods & Drinks" or unquoted tokens
     return [
         m.group(1) if m.group(1) is not None else m.group(2)
         for m in re.finditer(r'"([^"]+)"|(\S+)', s)
@@ -241,6 +292,46 @@ def parse_quoted_args(s: str) -> List[str]:
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user} (id={bot.user.id})", flush=True)
+
+
+@bot.command(name="listcats")
+async def listcats_cmd(ctx: commands.Context):
+    """Quick sanity command to prove categories were discovered."""
+    if not CAT_BY_ID:
+        await ctx.reply("No categories discovered from dataset.")
+        return
+    sample = list(CAT_BY_ID.items())[:25]
+    lines = [f"- {name} (id: {cid})" for cid, name in sample]
+    await ctx.reply(f"Categories discovered: {len(CAT_BY_ID)}\nSample:\n" + "\n".join(lines))
+
+
+@bot.command(name="findcat")
+async def findcat_cmd(ctx: commands.Context, *, query: str = ""):
+    """
+    Usage:
+      .findcat food
+      .findcat drink
+      .findcat everyday
+    """
+    q = norm_cat(query)
+    if not q:
+        await ctx.reply('Usage: .findcat <search term>  (ex: .findcat food)')
+        return
+
+    # Search across real names + ids
+    matches: List[Tuple[str, str]] = []
+    for cid, cname in CAT_BY_ID.items():
+        if q in norm_cat(cname) or q in norm_cat(cid):
+            matches.append((cname, cid))
+
+    matches.sort(key=lambda x: (x[0].lower(), x[1].lower()))
+    if not matches:
+        await ctx.reply("No category matches.")
+        return
+
+    lines = [f"- {name} (id: {cid})" for name, cid in matches[:40]]
+    more = "" if len(matches) <= 40 else f"\n…(+{len(matches)-40} more)"
+    await ctx.reply("Matching categories:\n" + "\n".join(lines) + more)
 
 
 @bot.command(name="categories")
@@ -279,8 +370,7 @@ async def categories_cmd(ctx: commands.Context):
     resolved_pretty: List[str] = []
 
     for t in tokens:
-        key = norm_cat(t)
-        hit = CAT_ALIASES.get(key)
+        hit = CAT_ALIASES.get(norm_cat(t))
         if hit:
             cid, cname = hit
             resolved_ids.add(norm_cat(cid))
@@ -288,11 +378,10 @@ async def categories_cmd(ctx: commands.Context):
         else:
             unresolved.append(t)
 
-    # If ANY are unresolved, we IGNORE them (we do NOT store unknowns).
     if not resolved_ids:
         await ctx.reply(
             "No valid categories recognized.\n"
-            'Tip: use `.findcat food` or `.findcat drink` to discover the exact category name/id.'
+            "Tip: try `.listcats` to see a sample, or `.findcat everyday` etc."
         )
         return
 
@@ -303,41 +392,6 @@ async def categories_cmd(ctx: commands.Context):
         msg += "\nIgnored (unknown):\n" + "\n".join(f"- {x}" for x in unresolved) + \
                "\nTip: use `.findcat <term>` to find the exact category name/id."
     await ctx.reply(msg)
-
-
-@bot.command(name="findcat")
-async def findcat_cmd(ctx: commands.Context, *, query: str = ""):
-    """
-    Usage:
-      .findcat food
-      .findcat drink
-      .findcat everyday
-    Shows matching categories with exact name + id.
-    """
-    q = norm_cat(query)
-    if not q:
-        await ctx.reply('Usage: .findcat <search term>  (ex: .findcat food)')
-        return
-
-    # CAT_ALIASES maps aliases -> (id, name). Deduplicate by id.
-    seen: Set[str] = set()
-    matches: List[Tuple[str, str]] = []
-
-    for alias, (cid, cname) in CAT_ALIASES.items():
-        if q in alias:
-            if cid in seen:
-                continue
-            seen.add(cid)
-            matches.append((cname, cid))
-
-    matches.sort(key=lambda x: (x[0].lower(), x[1].lower()))
-    if not matches:
-        await ctx.reply("No category matches.")
-        return
-
-    lines = [f"- {name}  (id: {cid})" for name, cid in matches[:40]]
-    more = "" if len(matches) <= 40 else f"\n…(+{len(matches)-40} more)"
-    await ctx.reply("Matching categories:\n" + "\n".join(lines) + more)
 
 
 @bot.event
@@ -351,7 +405,7 @@ async def on_message(message: discord.Message):
 
     lower = content.lower()
     # Let discord.py handle our actual commands
-    if lower.startswith(".categories") or lower.startswith(".findcat"):
+    if lower.startswith(".categories") or lower.startswith(".findcat") or lower.startswith(".listcats"):
         await bot.process_commands(message)
         return
 
