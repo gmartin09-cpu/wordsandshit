@@ -1,4 +1,5 @@
 import os
+import sys
 import re
 import asyncio
 import urllib.request
@@ -9,6 +10,16 @@ from typing import DefaultDict, Dict, List, Optional, Set, Tuple
 import discord
 from discord.ext import commands
 
+def require_env(name: str) -> str:
+    val = os.getenv(name)
+    if not val:
+        keys = sorted(os.environ.keys())
+        preview = ", ".join(keys[:40]) + (" ..." if len(keys) > 40 else "")
+        print(f"[FATAL] Missing env var: {name}")
+        print(f"[DEBUG] Available env keys (first 40): {preview}")
+        sys.exit(1)
+    return val
+    
 DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
 WORDS_FILE = os.environ["WORDS_FILE"]
 WORDS_URL = os.environ.get("WORDS_URL")  # optional
@@ -246,3 +257,4 @@ async def on_message(message: discord.Message):
 
 
 bot.run(TOKEN)
+
