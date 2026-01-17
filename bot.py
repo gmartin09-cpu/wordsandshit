@@ -14,15 +14,16 @@ def require_env(name: str) -> str:
     val = os.getenv(name)
     if not val:
         keys = sorted(os.environ.keys())
-        preview = ", ".join(keys[:40]) + (" ..." if len(keys) > 40 else "")
-        print(f"[FATAL] Missing env var: {name}")
-        print(f"[DEBUG] Available env keys (first 40): {preview}")
+        preview = ", ".join(keys[:60]) + (" ..." if len(keys) > 60 else "")
+        print(f"[FATAL] Missing env var: {name}", flush=True)
+        print(f"[DEBUG] Available env keys (first 60): {preview}", flush=True)
         sys.exit(1)
     return val
+
     
-DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
-WORDS_FILE = os.environ["WORDS_FILE"]
-WORDS_URL = os.environ.get("WORDS_URL")  # optional
+DISCORD_TOKEN = require_env("DISCORD_TOKEN")
+WORDS_FILE = require_env("WORDS_FILE")
+WORDS_URL = os.getenv("WORDS_URL")  # optional
 
 
 if not os.path.exists(WORDS_FILE):
@@ -257,4 +258,5 @@ async def on_message(message: discord.Message):
 
 
 bot.run(TOKEN)
+
 
